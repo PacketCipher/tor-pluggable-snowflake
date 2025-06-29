@@ -4,15 +4,31 @@ import re
 # Basic regex for IPv4 and common forms of IPv6
 # This is NOT exhaustive and may not cover all cases or may have false positives.
 # For production, a more robust IP address detection library might be needed.
-IP_REGEX = re.compile(
-    r"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|"  # IPv4
-    r"\b(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}\b|"  # Full IPv6
-    r"\b(?:[A-F0-9]{1,4}:){1,7}:(?:[A-F0-9]{1,4}:){1,7}\b|" # Compressed IPv6 (::)
-    r"::(?:[A-F0-9]{1,4}:){0,5}[A-F0-9]{1,4}\b|" # Leading ::
-    r"(?:[A-F0-9]{1,4}:){1,6}::\b" # Trailing ::
-    r")",
-    re.IGNORECASE
+
+# Regex for IPv4
+IPV4_REGEX_STR = r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"
+
+# Regex for IPv6 (covering various forms including compressed)
+# Order: Full, then general compressed. Specific short forms like '::' alone are covered by general.
+IPV6_REGEX_STR = (
+    # 1. Full, uncompressed (8 hex groups)
+    r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b|"
+    # 2. General compressed form (contains ::)
+    #    Matches X::Y where X and Y can be empty or multiple hex groups.
+    #    e.g., ::1, fe80::1, 1:2::3:4, 1::, ::
+    #    Pattern: (optional_left_part) :: (optional_right_part)
+    #    Left part: hex_group followed by optional more hex_groups_with_colons
+    #    Right part: similar
+    #    This should be non-greedy for the hex_group parts if possible, or structured to avoid issues.
+    #    A common robust regex for general IPv6 (including all :: forms):
+    r"\b((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)\b|"
+    # Handle cases like :: by itself if the above doesn't catch it due to word boundaries or group presence.
+    # The above general compressed form should catch '::' if word boundaries are appropriate.
+    # Also, specific forms if the general one has issues with edge cases like `::` or `1:2:3:4:5:6:7::`
+    r"\b::\b" # Just "::"
 )
+
+IP_REGEX = re.compile(f"({IPV4_REGEX_STR})|({IPV6_REGEX_STR.strip('|')})", re.IGNORECASE)
 REDACTED_IP = "[IP_REDACTED]"
 
 # TODO: Add regex for URLs or other sensitive info if needed.

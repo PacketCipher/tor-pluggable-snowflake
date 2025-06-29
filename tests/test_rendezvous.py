@@ -16,8 +16,7 @@ logging.basicConfig(level=logging.CRITICAL)
 
 class TestHttpRendezvousCurlCffi(unittest.TestCase):
 
-    @patch('curl_cffi.requests.AsyncSession.post', new_callable=AsyncMock)
-    async def test_exchange_offer_answer_success(self, mock_curl_post):
+    async def _async_test_exchange_offer_answer_success(self, mock_curl_post):
         # Mock the curl_cffi response
         mock_response = AsyncMock(spec=Response)
         mock_response.status_code = 200
@@ -40,9 +39,11 @@ class TestHttpRendezvousCurlCffi(unittest.TestCase):
         # Check impersonate profile was passed
         self.assertEqual(mock_curl_post.call_args.kwargs.get("impersonate"), "chrome120")
 
-
     @patch('curl_cffi.requests.AsyncSession.post', new_callable=AsyncMock)
-    async def test_exchange_offer_answer_broker_error(self, mock_curl_post):
+    def test_exchange_offer_answer_success(self, mock_curl_post):
+        asyncio.run(self._async_test_exchange_offer_answer_success(mock_curl_post))
+
+    async def _async_test_exchange_offer_answer_broker_error(self, mock_curl_post):
         mock_response = AsyncMock(spec=Response)
         mock_response.status_code = 200 # Broker can return 200 OK with an error field
         mock_response.json = unittest.mock.Mock(return_value={"error": "No proxies available"})
@@ -54,24 +55,35 @@ class TestHttpRendezvousCurlCffi(unittest.TestCase):
             await rendezvous.exchange_offer_answer("dummy_offer", "unknown")
 
     @patch('curl_cffi.requests.AsyncSession.post', new_callable=AsyncMock)
-    async def test_exchange_offer_answer_http_error(self, mock_curl_post):
-        # Simulate RequestsError for a status code
-        mock_response_obj = Response(None) # Create a dummy Response object for the error
-        mock_response_obj.status_code = 500
-        mock_response_obj.text = "Internal Server Error"
+    def test_exchange_offer_answer_broker_error(self, mock_curl_post):
+        asyncio.run(self._async_test_exchange_offer_answer_broker_error(mock_curl_post))
 
-        # The actual error raised by curl_cffi for HTTP status might be RequestsError
-        # and raise_for_status() would trigger it.
-        # We need to mock raise_for_status() to throw the error that the code expects to catch.
-        # Or, more simply, have the post call itself raise the error.
-        mock_curl_post.side_effect = RequestsError("HTTP 500", response=mock_response_obj)
+    async def _async_test_exchange_offer_answer_http_error(self, mock_curl_post):
+        mock_response = AsyncMock(spec=Response)
+        mock_response.status_code = 500
+        # Mock the .text property using a PropertyMock
+        type(mock_response).text = unittest.mock.PropertyMock(return_value="Internal Server Error Text")
+
+        # Configure raise_for_status on this mock_response to raise the RequestsError
+        # Manually create the error instance and attach the response, as RequestsError constructor
+        # might not take request/response kwargs directly.
+        error_instance = RequestsError(f"HTTP {mock_response.status_code} - Internal Server Error Text") # Message for the error
+        error_instance.response = mock_response # Attach the mock response to the error instance
+
+        mock_response.raise_for_status = unittest.mock.Mock(side_effect=error_instance)
+        mock_curl_post.return_value = mock_response # session.post returns this response object
 
         rendezvous = HttpRendezvous(broker_url="https://fakebroker.com")
-        with self.assertRaisesRegex(Exception, "Broker HTTP error: 500"):
+        # The string should match what's constructed in HttpRendezvous's except block for status errors
+        expected_error_msg = f"Broker HTTP error: {mock_response.status_code} - {mock_response.text}"
+        with self.assertRaisesRegex(Exception, expected_error_msg):
             await rendezvous.exchange_offer_answer("dummy_offer", "unknown")
 
     @patch('curl_cffi.requests.AsyncSession.post', new_callable=AsyncMock)
-    async def test_domain_fronting_curl_cffi(self, mock_curl_post):
+    def test_exchange_offer_answer_http_error(self, mock_curl_post):
+        asyncio.run(self._async_test_exchange_offer_answer_http_error(mock_curl_post))
+
+    async def _async_test_domain_fronting_curl_cffi(self, mock_curl_post):
         mock_response = AsyncMock(spec=Response)
         mock_response.status_code = 200
         mock_response.json = unittest.mock.Mock(return_value={"answer": "fronted_answer", "proxy_id": "front_proxy"})
@@ -95,7 +107,10 @@ class TestHttpRendezvousCurlCffi(unittest.TestCase):
         self.assertEqual(call_args.kwargs.get("impersonate"), "chrome110")
 
     @patch('curl_cffi.requests.AsyncSession.post', new_callable=AsyncMock)
-    async def test_no_impersonation(self, mock_curl_post):
+    def test_domain_fronting_curl_cffi(self, mock_curl_post):
+        asyncio.run(self._async_test_domain_fronting_curl_cffi(mock_curl_post))
+
+    async def _async_test_no_impersonation(self, mock_curl_post):
         mock_response = AsyncMock(spec=Response)
         mock_response.status_code = 200
         mock_response.json = unittest.mock.Mock(return_value={"answer": "ans", "proxy_id": "p1"})
@@ -108,10 +123,13 @@ class TestHttpRendezvousCurlCffi(unittest.TestCase):
         mock_curl_post.assert_called_once()
         self.assertIsNone(mock_curl_post.call_args.kwargs.get("impersonate"))
 
+    @patch('curl_cffi.requests.AsyncSession.post', new_callable=AsyncMock)
+    def test_no_impersonation(self, mock_curl_post):
+        asyncio.run(self._async_test_no_impersonation(mock_curl_post))
+
 
 class TestAmpCacheRendezvousCurlCffi(unittest.TestCase):
-    @patch('curl_cffi.requests.AsyncSession.get', new_callable=AsyncMock) # AMPCache uses GET
-    async def test_ampcache_exchange_success(self, mock_curl_get):
+    async def _async_test_ampcache_exchange_success(self, mock_curl_get):
         mock_response = AsyncMock(spec=Response)
         mock_response.status_code = 200
         mock_response.json = unittest.mock.Mock(return_value={
@@ -141,6 +159,10 @@ class TestAmpCacheRendezvousCurlCffi(unittest.TestCase):
         self.assertIn(base64.urlsafe_b64encode("realbroker.com".encode()).decode().rstrip("="), called_url)
         self.assertIn("/snowflake?payload=", called_url) # Path part
         self.assertEqual(mock_curl_get.call_args.kwargs.get("impersonate"), "safari170")
+
+    @patch('curl_cffi.requests.AsyncSession.get', new_callable=AsyncMock) # AMPCache uses GET
+    def test_ampcache_exchange_success(self, mock_curl_get):
+        asyncio.run(self._async_test_ampcache_exchange_success(mock_curl_get))
 
     # TODO: Add tests for AMPCache domain fronting, broker errors, HTTP errors similar to HttpRendezvous tests.
 
@@ -197,5 +219,6 @@ if __name__ == '__main__':
     # Simpler: just use unittest.main() which should handle async tests in Python 3.8+
     unittest.main()
 
-import httpx # For HTTPStatusError in mock
+# import httpx # No longer needed as httpx is replaced by curl_cffi
 import json # For SQS mock body
+import base64 # For TestAmpCacheRendezvousCurlCffi

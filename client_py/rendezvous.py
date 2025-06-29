@@ -3,8 +3,9 @@ import asyncio
 import logging
 import random
 from typing import List, Tuple, Optional, Dict
+from urllib.parse import urlparse, urlunparse
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from curl_cffi.requests import AsyncSession as CurlAsyncSession, RequestsError # Import RequestsError
 # Fallback or alternative client if needed, though curl_cffi is preferred now.
 # import httpx
 
@@ -76,22 +77,17 @@ class HttpRendezvous(RendezvousMethod):
 
         original_broker_host = ""
         if self.front_domains:
+            from urllib.parse import urlparse, urlunparse # Import here or at top of file
             chosen_front_domain_base = random.choice(self.front_domains)
 
-            # Parse the original broker URL to get its path and query
-            original_broker_url_parsed = CurlAsyncSession().base_url_from_str(self.broker_url) # Use curl_cffi's parsing logic if available, or urllib.parse
-            original_broker_host = original_broker_url_parsed.host
+            original_broker_url_parsed = urlparse(self.broker_url)
+            original_broker_host = original_broker_url_parsed.hostname
+            if not original_broker_host: # Should not happen for valid http URLs
+                raise ValueError(f"Could not parse hostname from broker URL: {self.broker_url}")
 
             # Construct the new URL using the front domain's base and original path/query
-            # This assumes front_domains are just base URLs (e.g., "https://front.example.com")
-            front_url_parsed = CurlAsyncSession().base_url_from_str(chosen_front_domain_base)
-            actual_request_url = str(front_url_parsed.join(original_broker_url_parsed.path))
-            # Note: .path includes leading slash. If original_broker_url_parsed.path is empty, .join might not be ideal.
-            # A more robust way:
-            # actual_request_url = f"{chosen_front_domain_base.rstrip('/')}{original_broker_url_parsed.path}"
-            # if original_broker_url_parsed.query:
-            #    actual_request_url += f"?{original_broker_url_parsed.query}"
-
+            path_and_query = urlunparse(('', '', original_broker_url_parsed.path, original_broker_url_parsed.params, original_broker_url_parsed.query, original_broker_url_parsed.fragment))
+            actual_request_url = f"{chosen_front_domain_base.rstrip('/')}{path_and_query}"
 
             headers["Host"] = original_broker_host
             logger.info(f"Using domain fronting: Requesting {actual_request_url}, Host header: {headers['Host']}")
@@ -102,11 +98,11 @@ class HttpRendezvous(RendezvousMethod):
         # Construct the JSON payload as expected by the Snowflake broker
         # {
         #   "type": "client",
-        //   "nat": "restricted" | "unrestricted" | "unknown",
-        //   "version": "2.6.0", /* protocol version */
-        //   "offer": "...",     /* SDP */
-        //   "delete": "...",    /* an poll-id to be deleted (optional) */
-        // }
+        #   "nat": "restricted" | "unrestricted" | "unknown", # example value
+        #   "version": "2.6.0", # example value, /* protocol version */
+        #   "offer": "...",     # example value /* SDP */
+        #   "delete": "..."     # example value /* an poll-id to be deleted (optional) */
+        # }
         payload = {
             "type": "client",
             "nat": client_nat_type,
@@ -130,11 +126,11 @@ class HttpRendezvous(RendezvousMethod):
 
                 # Expected successful response:
                 # {
-                //   "answer": "...",    /* SDP */
-                //   "proxy_id": "...",  /* an opaque ID for the proxy (optional) */
-                //   "poll_id": "...",   /* an ID to use for future polls (optional) */
-                //   "error": "..."      /* an error message (optional) */
-                // }
+                #   "answer": "...",    /* SDP */
+                #   "proxy_id": "...",  /* an opaque ID for the proxy (optional) */
+                #   "poll_id": "...",   /* an ID to use for future polls (optional) */
+                #   "error": "..."      /* an error message (optional) */
+                # }
                 data = response.json()
 
                 if "error" in data and data["error"]:
@@ -151,10 +147,10 @@ class HttpRendezvous(RendezvousMethod):
                 logger.info(f"Successfully received answer from broker for proxy: {proxy_id}")
                 return proxy_sdp_answer, proxy_id
 
-            except CurlAsyncSession().RequestsError as e: # curl_cffi specific exception for request errors
+            except RequestsError as e: # Corrected exception type
                 # This includes status errors (like HTTPStatusError) and connection errors
                 status_code = e.response.status_code if hasattr(e, 'response') and e.response else "N/A"
-                response_text = e.response.text if hasattr(e, 'response') and e.response else "N/A"
+                response_text = e.response.text if hasattr(e, 'response') and e.response else "N/A" # .text should be fine on actual Response
                 logger.error(f"curl_cffi HTTP error occurred while contacting broker: Status {status_code} - {response_text} (Error: {e})")
                 # Distinguish between status errors and other request errors if possible
                 if hasattr(e, 'response') and e.response is not None: # Likely an HTTP status error
@@ -412,16 +408,20 @@ class AmpCacheRendezvous(RendezvousMethod):
         # <ampcache_url>/v0/s/<broker_host>/<broker_path_prefix>/<broker_query_args_base64_encoded>
         # This needs to be constructed carefully.
         self.ampcache_url = ampcache_url.rstrip('/')
+        self.target_broker_url = target_broker_url # Assign target_broker_url
 
         # Front domains can also be used with AMP Cache, similar to HTTP rendezvous.
         # The Host header would be the AMP Cache's host, and the request URL targets the front.
         # However, the primary purpose of AMP Cache is often to use the AMP provider's domain as the front.
         self.front_domains = front_domains if front_domains else []
+        self.impersonate_profile = impersonate_profile # Store impersonate_profile
 
-        self.utls_client_id = utls_client_id
-        self.utls_remove_sni = utls_remove_sni
-        if self.utls_client_id or self.utls_remove_sni:
-            logger.warning("uTLS features are not fully supported by the current HTTP client for AMP Cache.")
+        # self.utls_client_id = utls_client_id # These are superseded by impersonate_profile
+        # self.utls_remove_sni = utls_remove_sni
+        # if self.utls_client_id or self.utls_remove_sni:
+        #     logger.warning("uTLS features are superseded by impersonate_profile for AMP Cache.")
+        logger.info(f"AmpCacheRendezvous initialized. AMP URL: {self.ampcache_url}, Target Broker: {self.target_broker_url}, Impersonate: {self.impersonate_profile}")
+
 
     async def exchange_offer_answer(self, offer_sdp: str, client_nat_type: str) -> Tuple[str, str]:
         """
@@ -454,125 +454,91 @@ class AmpCacheRendezvous(RendezvousMethod):
         but via AMP cache. The broker's `broker/amp.go` suggests it has an endpoint like `/amp`
         that takes the base64 encoded payload.
 
-        The Go client (`client/lib/rendezvous_ampcache.go`) constructs the AMP URL as:
-        ampURL = ampcacheURL + "/v0/s/" + base64URLEncode(brokerHost) + path + "?payload=" + base64URLEncode(jsonPayload)
-        This seems to target a GET request to the AMP cache, with the payload in query params.
-        The `path` variable in Go is `u.EscapedPath()`, so if broker is `https://broker.example.com/snowflake/`, path is `/snowflake/`.
-        If broker is `https://broker.example.com/`, path is `/`.
-
-        Let's reconcile with `broker/amp.go`:
-        It defines `handleAMPRequest` for `/amp/{payloadB64}`. This suggests payload is in path.
-
-        If `config.broker_url` is "https://snowflake-broker.example.com/request"
-        And `config.ampcache_url` is "https://amp.example.com"
-        The AMP cache is asked to fetch:
-        `https://amp.example.com/v0/s/snowflake-broker.example.com/request/amp/<base64_payload_for_broker>`
-        This means the broker needs an endpoint like `/request/amp/`.
-
-        Let's simplify based on `client/lib/rendezvous_ampcache.go` which seems to be the source of truth for client behavior.
-        It prepares a JSON payload: `{"type": "client", "nat": ..., "offer": ..., "version": ...}`
-        Then, it constructs the AMP URL:
-        `ampcacheBaseURL + "/v0/s/" + base64URLEncode(brokerHost) + brokerPath + "?payload=" + base64URLEncode(jsonPayload)`
-        This implies the broker itself is *not* directly using an `/amp/{payload}` endpoint if called via AMP.
-        Instead, the AMP cache makes a GET to `brokerHost + brokerPath` with `?payload=` query.
-        The broker's main endpoint must then be able to handle GET requests with this `payload` query param.
-        The `broker/http.go` `handleClientRequest` *does* support GET and POST, and parses `payload` from query for GET.
-
-        So, the `broker_url` passed to this function should be the *actual broker's* endpoint URL.
+        which in turn makes a GET request (with payload in query) to the actual Snowflake broker.
         """
+        # urllib.parse.urlparse and urlunparse are imported at the top of the file.
+        # base64 and json are also imported at the top of the file (for SQS, but useful here too).
+        try:
+            parsed_target_broker = urlparse(self.target_broker_url)
+            broker_host = parsed_target_broker.hostname
+            if not broker_host:
+                raise ValueError(f"Could not parse hostname from target_broker_url: {self.target_broker_url}")
 
-        # This is the broker's actual endpoint URL that the AMP cache will be instructed to fetch.
-        # This was a bit confusing, the HttpRendezvous takes the broker_url directly.
-        # For AMP, we need the *broker's* url to build the AMP cache request.
-        # Let's assume the `HttpRendezvous` broker_url is what we need here.
-        # The calling code will need to pass the main broker_url.
-        # This class should probably take the main broker_url in its constructor too.
-        # For now, let's assume it's implicitly the "target" for the AMP cache.
-        # This means the `self.broker_url` used in HttpRendezvous needs to be accessible or passed.
-        # This suggests a slight refactor or clear documentation on what URL is expected.
+            broker_path = parsed_target_broker.path if parsed_target_broker.path else "/"
+            # Ensure broker_path starts with a slash
+            if not broker_path.startswith("/"): # Should always be true from urlparse if path is not empty
+                 broker_path = "/" + broker_path
 
-        # Let's assume this method is called with the *actual broker URL* that the AMP cache should proxy to.
-        # And `self.ampcache_url` is the prefix for the AMP cache itself.
 
-        # This component is tricky. The `HttpRendezvous` takes `broker_url`. If AmpCacheRendezvous
-        # is chosen, it means the `broker_url` from config is actually the *target* broker,
-        # and `ampcache_url` from config is the AMP cache service.
+            # Base64 URL-safe encode the broker's hostname
+            broker_host_b64 = base64.urlsafe_b64encode(broker_host.encode('utf-8')).decode('utf-8').rstrip("=")
 
-        # This method should be called with the *target broker URL* that the AMP cache will request.
-        # This is a bit of a design smell if it relies on an external broker_url not passed at init.
-        # Let's refine: The AmpCacheRendezvous should know the *target_broker_url* at init.
-        # However, the `RendezvousMethod` interface doesn't enforce this.
-        # Re-reading `client/lib/snowflake.go` `newBrokerChannelFromConfig`:
-        # If AmpCacheURL is set, it creates `NewAmpCacheRendezvous(config.AmpCacheURL, config.BrokerURL, ...)`
-        # So, AmpCacheRendezvous *does* get both URLs at init. I need to adjust my constructor.
+            payload_dict = {
+                "type": "client",
+                "nat": client_nat_type,
+                "offer": offer_sdp,
+                "version": "2.8.0-python-amp"
+            }
+            payload_json_bytes = json.dumps(payload_dict).encode('utf-8')
+            payload_b64 = base64.urlsafe_b64encode(payload_json_bytes).decode('utf-8').rstrip("=")
 
-        raise NotImplementedError("AmpCacheRendezvous needs its constructor updated to accept target_broker_url.")
+            ampcache_request_url = f"{self.ampcache_url}/v0/s/{broker_host_b64}{broker_path}?payload={payload_b64}"
 
-        # The following is a sketch based on updated understanding:
-        # target_broker_url_parsed = httpx.URL(self.target_broker_url)
-        # broker_host_b64 = base64.urlsafe_b64encode(target_broker_url_parsed.host.encode()).decode().rstrip("=")
-        # broker_path = target_broker_url_parsed.path if target_broker_url_parsed.path else "/"
+            headers = {"Accept": "application/json"}
+            actual_final_url_for_amp = ampcache_request_url
 
-        # payload_dict = {
-        #     "type": "client",
-        #     "nat": client_nat_type,
-        #     "offer": offer_sdp,
-        #     "version": "2.8.0-python-amp" # TODO: Proper versioning
-        # }
-        # payload_json = json.dumps(payload_dict)
-        # payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).decode().rstrip("=")
+            if self.front_domains:
+                chosen_front_domain_base = random.choice(self.front_domains)
+                parsed_amp_url_for_fronting = urlparse(ampcache_request_url)
 
-        # # Construct the full AMP cache request URL
-        # # e.g., https://ampcache.com/v0/s/bGlhbWxnLm9yZw==/path/to/endpoint?payload=eyJ0eXBlIjoiY2xpZW50...
-        # ampcache_request_url = f"{self.ampcache_url}/v0/s/{broker_host_b64}{broker_path}?payload={payload_b64}"
+                path_and_query_for_front = urlunparse(('', '', parsed_amp_url_for_fronting.path, parsed_amp_url_for_fronting.params, parsed_amp_url_for_fronting.query, parsed_amp_url_for_fronting.fragment))
+                actual_final_url_for_amp = f"{chosen_front_domain_base.rstrip('/')}{path_and_query_for_front}"
 
-        # headers = {"Accept": "application/json"} # Broker is expected to return JSON
-        # actual_final_url = ampcache_request_url
-        # chosen_front_domain = None
+                amp_service_host = parsed_amp_url_for_fronting.hostname
+                if amp_service_host:
+                    headers["Host"] = amp_service_host
+                    logger.info(f"Using AMP Cache with domain fronting: Requesting {actual_final_url_for_amp}, Host header: {headers['Host']}")
+                else:
+                    logger.warning(f"Could not parse hostname from AMP Cache URL {ampcache_request_url} for fronting. Proceeding without explicit Host header override for front.")
+            else:
+                logger.info(f"Using AMP Cache directly: {ampcache_request_url}")
 
-        # if self.front_domains:
-        #     chosen_front_domain = random.choice(self.front_domains)
-        #     front_domain_parsed = httpx.URL(chosen_front_domain)
-        #     amp_url_parsed = httpx.URL(ampcache_request_url) # This is the URL for the AMP cache service
+            async with CurlAsyncSession() as session:
+                response = await session.get(
+                    actual_final_url_for_amp,
+                    headers=headers,
+                    timeout=30.0,
+                    impersonate=self.impersonate_profile if self.impersonate_profile else None
+                )
+                response.raise_for_status()
 
-        #     # The request goes to the front domain, path is from ampcache_request_url, Host is ampcache_url's host
-        #     actual_final_url = str(front_domain_parsed.join(amp_url_parsed.path_with_query))
-        #     headers["Host"] = amp_url_parsed.host
-        #     logger.info(f"Using AMP Cache with domain fronting: Requesting {actual_final_url}, Host header: {headers['Host']}")
-        # else:
-        #     logger.info(f"Using AMP Cache directly: {ampcache_request_url}")
+                data = response.json()
 
-        # async with httpx.AsyncClient(http2=True) as client:
-        #     try:
-        #         # AMP Caches expect GET requests for this type of proxying
-        #         response = await client.get(actual_final_url, headers=headers, timeout=30.0)
-        #         response.raise_for_status()
+                if "error" in data and data["error"]:
+                    logger.error(f"Broker (via AMP Cache) returned an error: {data['error']}")
+                    raise Exception(f"Broker/AMP error: {data['error']}")
 
-        #         data = response.json() # Broker's response, proxied through AMP cache
+                if "answer" not in data:
+                    logger.error(f"Broker response (via AMP Cache) missing 'answer': {data}")
+                    raise Exception("Broker/AMP response missing 'answer'")
 
-        #         if "error" in data and data["error"]:
-        #             logger.error(f"Broker (via AMP Cache) returned an error: {data['error']}")
-        #             raise Exception(f"Broker/AMP error: {data['error']}")
+                proxy_sdp_answer = data["answer"]
+                proxy_id = data.get("proxy_id", "unknown_amp_proxy")
 
-        #         if "answer" not in data:
-        #             logger.error(f"Broker response (via AMP Cache) missing 'answer': {data}")
-        #             raise Exception("Broker/AMP response missing 'answer'")
+                logger.info(f"Successfully received answer via AMP Cache for proxy: {proxy_id}")
+                return proxy_sdp_answer, proxy_id
 
-        #         proxy_sdp_answer = data["answer"]
-        #         proxy_id = data.get("proxy_id", "unknown_amp_proxy")
-
-        #         logger.info(f"Successfully received answer via AMP Cache for proxy: {proxy_id}")
-        #         return proxy_sdp_answer, proxy_id
-
-        #     except httpx.HTTPStatusError as e:
-        #         logger.error(f"HTTP error with AMP Cache: {e.response.status_code} - {e.response.text}")
-        #         raise Exception(f"AMP Cache HTTP error: {e.response.status_code}") from e
-        #     except httpx.RequestError as e:
-        #         logger.error(f"Request error with AMP Cache: {e}")
-        #         raise Exception(f"AMP Cache request error: {type(e).__name__}") from e
-        #     except Exception as e:
-        #         logger.error(f"An unexpected error occurred during AMP Cache rendezvous: {e}")
-        #         raise
+        except RequestsError as e:
+            status_code = e.response.status_code if hasattr(e, 'response') and e.response else "N/A"
+            response_text = e.response.text if hasattr(e, 'response') and e.response else "N/A"
+            logger.error(f"curl_cffi HTTP error with AMP Cache: Status {status_code} - {response_text} (Error: {e})")
+            if hasattr(e, 'response') and e.response is not None:
+                 raise Exception(f"AMP Cache HTTP error: {status_code} - {response_text}") from e
+            else:
+                 raise Exception(f"AMP Cache request error (curl_cffi): {type(e).__name__} - {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during AMP Cache rendezvous: {e}", exc_info=True)
+            raise
 
 
 # --- Factory function for creating rendezvous method ---

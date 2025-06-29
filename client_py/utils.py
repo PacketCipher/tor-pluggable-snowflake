@@ -26,10 +26,18 @@ RADDR_REGEX = re.compile(r"raddr (?P<raddr_ip>\S+)")
 
 
 def is_local_ip(ip_str: str) -> bool:
-    """Checks if an IP address string is a local/private IP."""
+    """
+    Checks if an IP address string is considered 'local' for WebRTC purposes.
+    This typically means it's not a globally routable address.
+    Includes private, loopback, link-local, and unspecified addresses.
+    Also includes a heuristic for ".local" hostnames.
+    """
     try:
         ip_obj = ipaddress.ip_address(ip_str)
-        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+        # An IP is considered "local" if it's not global, or if it's unspecified (like "::" or "0.0.0.0")
+        # which are sometimes filtered. is_global correctly identifies RFC1918, loopback, link-local as not global.
+        # is_unspecified handles "0.0.0.0" and "::".
+        return (not ip_obj.is_global) or ip_obj.is_unspecified
     except ValueError:
         # Could be a hostname (e.g., mDNS .local) - treat as potentially local if it ends with .local
         # This is a heuristic. For WebRTC, .local hostnames are usually for local candidates.
