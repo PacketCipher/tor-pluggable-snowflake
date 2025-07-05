@@ -1,0 +1,5 @@
+aiortc
+httpx
+boto3
+socksio
+curl_cffi
