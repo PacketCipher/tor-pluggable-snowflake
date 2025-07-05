@@ -158,14 +158,29 @@ async def handle_socks_client(
 
         # Temporary workaround for testing SOCKS layer:
         # Let's assume dial sets up snowflake_conn.underlying_connection (PeerConnection)
-        await snowflake_conn.dial()
-        if not snowflake_conn.underlying_connection or \
-           not snowflake_conn.underlying_connection.is_connected or \
-           not snowflake_conn.underlying_connection.web_rtc_handler.data_channel:
-            logger.error("SOCKS: Snowflake dial completed but no usable underlying WebRTC connection found.")
-            raise ConnectionRefusedError("Snowflake dial failed to provide a usable WebRTC channel.")
+        # await snowflake_conn.dial()
+        # if not snowflake_conn.underlying_connection or \
+        #    not snowflake_conn.underlying_connection.is_connected or \
+        #    not snowflake_conn.underlying_connection.web_rtc_handler.data_channel:
+        #     logger.error("SOCKS: Snowflake dial completed but no usable underlying WebRTC connection found.")
+        #     raise ConnectionRefusedError("Snowflake dial failed to provide a usable WebRTC channel.")
 
-        logger.info("SOCKS: Snowflake connection (conceptual WebRTC peer) established.")
+        # logger.info("SOCKS: Snowflake connection (conceptual WebRTC peer) established.")
+
+        # --- New KCP/SMUX Integration ---
+        loop = asyncio.get_event_loop()
+        snowflake_conn = SnowflakeConn(current_config, rendezvous_method, loop)
+        await snowflake_conn.dial() # Sets up KCP and SMUX session internally
+
+        smux_stream = await snowflake_conn.open_smux_stream()
+        if not smux_stream:
+            # Dial or open_smux_stream should raise if it fails critically
+            logger.error("SOCKS: Failed to get SMUX stream from SnowflakeConn.")
+            raise ConnectionRefusedError("Failed to establish SMUX stream.")
+
+        logger.info(f"SOCKS: SMUX stream {smux_stream.stream_id} established for target {event.address}:{event.port}")
+        # --- End New KCP/SMUX Integration ---
+
 
         # 3. Send SOCKS success reply
         # The address and port in the reply should be the bound address on the server side,
@@ -179,104 +194,58 @@ async def handle_socks_client(
         await client_writer.drain()
         logger.info(f"SOCKS: Success reply sent to {client_addr}. Starting data proxy.")
 
-        # 4. Proxy data
-        # This requires adapting the SmuxStream (or WebRTC DC) to asyncio.StreamReader/Writer interface
-        # or using their send/receive methods directly in copy_data.
-
-        # For the temporary workaround (direct WebRTC DC):
-        # We need to create reader/writer wrappers around the WebRTC data channel.
-        # aiortc's RTCDataChannel has `send(str)` and `on("message", func)`
-
-        # Create pipe-like objects for the WebRTC data channel
-        web_rtc_reader_pipe, web_rtc_writer_pipe = os.pipe() # os.pipe for local IPC
-
-        # Forward messages from WebRTC DC to the reader end of the pipe
-        # And data written to writer end of pipe should be sent via WebRTC DC
-
-        # This is getting complex. A simpler way for the stub:
-        # Have two copy tasks.
-        # SOCKS_Client -> WebRTC_DC
-        # WebRTC_DC -> SOCKS_Client
-
-        # Reusing the WebRTCHandler from the snowflake_conn's underlying_connection
-        dc = snowflake_conn.underlying_connection.web_rtc_handler.data_channel
-        if not dc: # Should not happen if dial worked
-            raise ConnectionError("Data channel is None after successful dial.")
-
-        # Task 1: SOCKS client_reader -> WebRTC DataChannel
-        async def socks_to_webrtc():
+        # 4. Proxy data using SMUX stream
+        async def socks_to_smux():
             try:
-                while not client_reader.at_eof():
-                    data = await client_reader.read(4096)
-                    if not data: break
-                    # logger.debug(f"SOCKS->WebRTC: Sending {len(data)} bytes")
-                    dc.send(data.decode('utf-8', errors='replace')) # Assuming text for now, or use bytes if DC configured for binary
+                while True:
+                    data = await client_reader.read(4096) # Read from SOCKS client
+                    if not data: break # SOCKS client closed connection
+                    await smux_stream.write(data) # Write to SMUX stream
             except asyncio.CancelledError:
-                logger.info("socks_to_webrtc cancelled.")
+                logger.info(f"SOCKS->SMUX copy task for stream {smux_stream.stream_id} cancelled.")
             except Exception as e:
-                logger.error(f"Error in socks_to_webrtc: {e}")
+                logger.error(f"Error in SOCKS->SMUX for stream {smux_stream.stream_id}: {e}")
             finally:
-                logger.info("socks_to_webrtc finished.")
-                # Consider closing the WebRTC DC or SnowflakeConn here if this direction ends.
-                # Or let the main handler do it.
-
-        # Task 2: WebRTC DataChannel -> SOCKS client_writer
-        # Need a queue to pass messages from DC's on("message") to this task
-        webrtc_incoming_queue = asyncio.Queue()
-
-        original_on_message = snowflake_conn.underlying_connection.web_rtc_handler._on_message_callback
-        async def new_on_message(message: str): # Or bytes if binary
-            # logger.debug(f"WebRTC->SOCKS: Queuing {len(message)} bytes")
-            await webrtc_incoming_queue.put(message.encode('utf-8', errors='replace')) # Assuming text from DC
-            if original_on_message: # If KCP stub was wired, it would be called too
-                 # This part is messy, shows the problem with direct DC use + stubs
-                 # await original_on_message(message)
-                 pass
-
-
-        snowflake_conn.underlying_connection.web_rtc_handler._on_message_callback = new_on_message
-
-        async def webrtc_to_socks():
-            try:
-                while True: # Loop until an exit condition
-                    # Wait for a message from the WebRTC DC via the queue
-                    # Add a timeout to prevent hanging if DC closes without a final message
+                logger.info(f"SOCKS->SMUX copy task for stream {smux_stream.stream_id} finished.")
+                # Half-close the SMUX stream (send FIN)
+                if not smux_stream._local_fin_sent: # Check internal flag if available, or just call close
                     try:
-                        data = await asyncio.wait_for(webrtc_incoming_queue.get(), timeout=SNOWFLAKE_TIMEOUT * 2)
-                    except asyncio.TimeoutError:
-                        logger.warning("webrtc_to_socks: Timeout waiting for message from WebRTC queue. Assuming DC closed.")
-                        break
+                        await smux_stream.close()
+                    except Exception: # Ignore errors on close during cleanup
+                        pass
 
-                    if data is None: # Sentinel for close
-                        logger.info("webrtc_to_socks: Received None sentinel, closing.")
-                        break
 
-                    client_writer.write(data)
+        async def smux_to_socks():
+            try:
+                while True:
+                    data = await smux_stream.read(4096) # Read from SMUX stream
+                    if not data: break # SMUX stream EOF (remote sent FIN and all data read)
+                    client_writer.write(data) # Write to SOCKS client
                     await client_writer.drain()
-                    webrtc_incoming_queue.task_done()
             except asyncio.CancelledError:
-                logger.info("webrtc_to_socks cancelled.")
+                logger.info(f"SMUX->SOCKS copy task for stream {smux_stream.stream_id} cancelled.")
             except Exception as e:
-                logger.error(f"Error in webrtc_to_socks: {e}")
+                logger.error(f"Error in SMUX->SOCKS for stream {smux_stream.stream_id}: {e}")
             finally:
-                logger.info("webrtc_to_socks finished.")
-                # If this direction ends, close the SOCKS writer.
+                logger.info(f"SMUX->SOCKS copy task for stream {smux_stream.stream_id} finished.")
+                # Close the SOCKS client writer when SMUX stream ends from remote
                 if not client_writer.is_closing():
                     client_writer.close()
+                    # await client_writer.wait_closed() # Avoid potential hang
 
+        task_s2m = loop.create_task(socks_to_smux(), name=f"s2m_sid{smux_stream.stream_id}")
+        task_m2s = loop.create_task(smux_to_socks(), name=f"m2s_sid{smux_stream.stream_id}")
 
-        task1 = asyncio.create_task(socks_to_webrtc(), name="socks_to_webrtc_copy")
-        task2 = asyncio.create_task(webrtc_to_socks(), name="webrtc_to_socks_copy")
-
-        # Wait for both copy tasks to complete
-        # If one errors, we should cancel the other.
-        done, pending = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait([task_s2m, task_m2s], return_when=asyncio.FIRST_COMPLETED)
 
         for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True) # Wait for pending to actually cancel
+            if not task.done(): # Check if not already done (e.g. other task errored quickly)
+                task.cancel()
 
-        logger.info(f"SOCKS: Data proxying finished for {client_addr}.")
+        # Await all tasks to ensure cleanup and catch exceptions
+        await asyncio.gather(task_s2m, task_m2s, return_exceptions=True)
+
+        logger.info(f"SOCKS: Data proxying finished for {client_addr} on SMUX stream {smux_stream.stream_id}.")
 
     except socksio.SOCKSException as e:
         logger.error(f"SOCKS: Protocol error with {client_addr}: {e}", exc_info=True)

@@ -6,11 +6,13 @@ This directory contains a Python implementation of the Snowflake client, designe
 
 The Python Snowflake client allows users to connect to the Tor network by routing traffic through ephemeral Snowflake proxies. It operates as a SOCKS proxy that, when launched as a Tor Pluggable Transport, helps users bypass internet censorship.
 
-**Current Status:** This implementation is under development. Key functionalities like WebRTC communication, various rendezvous mechanisms (HTTP, SQS), SOCKS proxying, and PT protocol integration are implemented. However, the KCP and SMUX layers, which are used in the Go client for stream multiplexing and potentially specific transport characteristics over WebRTC, are currently **STUBS** and non-functional. This means the client, in its current state, would typically use a direct WebRTC data channel per SOCKS connection rather than multiplexing streams as the Go client does.
+**Current Status:** This implementation now includes functional KCP and SMUX layers, enabling stream multiplexing over a reliable KCP session on top of WebRTC data channels. This brings its core transport mechanism closer to the Go client's architecture. While these are minimal implementations focused on compatibility, they provide the necessary functionality. Other features like rendezvous mechanisms (HTTP, SQS), SOCKS proxying, and PT protocol integration remain.
 
 ## Features
 
 *   SOCKS5 proxy server.
+*   KCP protocol layer for reliable packet delivery over WebRTC.
+*   SMUX protocol layer for stream multiplexing over KCP.
 *   WebRTC communication via `aiortc`.
 *   Multiple rendezvous mechanisms for discovering Snowflake proxies:
     *   HTTP/HTTPS Broker
@@ -23,7 +25,7 @@ The Python Snowflake client allows users to connect to the Tor network by routin
 
 ## Limitations
 
-*   **KCP and SMUX Layers**: These are currently stubs (`kcp_handler.py`, `smux_handler.py`) and do not provide the stream multiplexing or specific transport characteristics of the Go client. This is the most significant deviation from the Go client's full functionality.
+*   **KCP and SMUX Layers**: Minimal Python implementations of KCP and SMUX (Version 2) are now included in `kcp_handler.py` and `smux_handler.py` respectively. These aim for wire-compatibility with the Go client's `xtaci/kcp-go` and `xtaci/smux` libraries, providing stream multiplexing over a KCP-managed reliable session. While functional, they are not full feature ports of the Go libraries and may have different performance characteristics or lack some advanced features of the original KCP/SMUX (e.g., detailed SACK, complex congestion control beyond what's configured, sophisticated SMUX send-side flow control).
 *   **NAT Type Detection**: Automatic NAT type detection (like the Go client's `updateNATType`) is not yet implemented. It defaults to "unknown".
 *   **TOR_PT_PROXY**: Full support for using a proxy specified by `TOR_PT_PROXY` for rendezvous communication is work-in-progress.
 *   **Comprehensive Testing**: While unit tests for utilities and some components exist, full integration and end-to-end tests are pending.
@@ -50,12 +52,12 @@ This includes:
 ```
 client_py/
 ├── config.py               # Command-line argument parsing and configuration
-├── kcp_handler.py          # STUB: KCP protocol handler
+├── kcp_handler.py          # KCP protocol implementation
 ├── pt_launcher.py          # Main script for Pluggable Transport integration
 ├── rendezvous.py           # Rendezvous mechanisms (HTTP, SQS, AMPCache)
 ├── safe_logger.py          # Safe log formatter for redacting sensitive info
-├── smux_handler.py         # STUB: SMUX protocol handler
-├── snowflake_conn.py       # Manages Snowflake connections (Peers, WebRTC)
+├── smux_handler.py         # SMUX (v2) protocol implementation
+├── snowflake_conn.py       # Manages Snowflake connections (Peers, WebRTC, KCP, SMUX)
 ├── socks_proxy.py          # SOCKS5 proxy implementation
 ├── utils.py                # Helper utilities (e.g., SDP filtering)
 ├── webrtc_handler.py       # WebRTC peer connection and data channel logic

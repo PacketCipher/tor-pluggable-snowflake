@@ -21,6 +21,10 @@ class ClientConfig:
     impersonate_profile: Optional[str] = "chrome120" # Default impersonation profile
     # For PT integration
     pt_proxy_url: Optional[str] = None # From TOR_PT_PROXY env var or SOCKS args
+    # SMUX config
+    smux_max_stream_buffer: int = 1048576 # 1MB, matching Go client's StreamSize
+    smux_keep_alive_interval: int = 2 * 60 + 30 # 2.5 minutes (150s), derived from Go's 10 min timeout / 4
+    smux_max_frame_size: int = 32768 # Matches xtaci/smux default MaxFrameSize
 
 def parse_args() -> ClientConfig:
     parser = argparse.ArgumentParser(description="Snowflake Client in Python", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
