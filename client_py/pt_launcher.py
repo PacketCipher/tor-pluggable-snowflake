@@ -210,7 +210,7 @@ async def main_pt():
 
     requested_transports = [t.strip() for t in client_transports_str.split(',') if t.strip()]
     if not requested_transports or "snowflake" not in requested_transports:
-        pt_log("No recognized client transports requested (expected 'snowflake'). Exiting.", severity="err")
+        pt_log_msg("No recognized client transports requested (expected 'snowflake'). Exiting.", severity="err")
         pt_cmethods_done()
         return 1
 
@@ -301,7 +301,7 @@ async def main_pt():
     except asyncio.CancelledError:
         logger.info("Main PT task cancelled.")
     except Exception as e:
-        pt_log(f"Fatal error in PT launcher: {e}", severity="err")
+        pt_log_msg(f"Fatal error in PT launcher: {e}", severity="err") # Changed pt_log to pt_log_msg
         logger.error(f"Fatal error in PT launcher: {e}", exc_info=True)
         # Ensure CMETHODS DONE is sent if we error out before it.
         # This depends on where the error occurs.

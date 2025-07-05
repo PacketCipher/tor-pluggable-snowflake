@@ -17,11 +17,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Environment variable to skip live tests
-SKIP_LIVE_TESTS = os.environ.get("SKIP_LIVE_TESTS") == "1"
+SKIP_LIVE_TESTS = os.environ.get("SKIP_LIVE_TESTS") == "1" # Standard skip logic
 DEFAULT_BROKER_URL = "https://snowflake-broker.torproject.net/"
 DEFAULT_IMPERSONATE_PROFILE = "chrome120" # A common, recent profile
 
-@unittest.skipIf(SKIP_LIVE_TESTS, "Skipping live integration tests that hit external services.")
+@unittest.skipIf(SKIP_LIVE_TESTS, "Skipping live integration tests that hit external services.") # Reinstated
 class TestHttpRendezvousLive(unittest.TestCase):
 
     def _run_async(self, coro):
@@ -73,27 +73,20 @@ class TestHttpRendezvousLive(unittest.TestCase):
             logger.info(f"Received Answer SDP (first 100 chars): {answer_sdp[:100].replace(os.linesep, ' ')}...")
 
             self.assertTrue(answer_sdp, "Answer SDP should not be empty.")
-            # Proxy ID can sometimes be empty/None from some brokers if no specific ID is assigned.
-            # For Tor Snowflake broker, it's usually present.
             self.assertIsNotNone(proxy_id, "Proxy ID should ideally be present.")
 
-            # Basic validation of answer SDP content
             self.assertIn("v=0", answer_sdp.lower())
-            self.assertIn("o=-", answer_sdp.lower()) # Common part of SDP origin line
+            self.assertIn("o=-", answer_sdp.lower())
             self.assertIn("a=ice-ufrag", answer_sdp.lower())
-            self.assertIn("a=candidate", answer_sdp.lower()) # Expect at least one candidate typically
-            self.assertIn("m=application", answer_sdp.lower()) # Media line for data channel
+            self.assertIn("a=candidate", answer_sdp.lower())
+            self.assertIn("m=application", answer_sdp.lower())
 
             logger.info("Live HttpRendezvous exchange test successful.")
 
         except Exception as e:
-            # This could be a network issue, broker issue, or an issue with our client/impersonation.
-            # For a CI test, we might want to distinguish transient errors from client bugs.
             logger.error(f"Live HttpRendezvous exchange failed: {e}", exc_info=True)
             if "No proxies available" in str(e):
                 logger.warning("Broker reported no proxies available. This is a valid broker response but means no proxy obtained.")
-                # Depending on strictness, this could be a pass or a specific type of skip/fail.
-                # For now, let's consider it a pass for the communication itself.
                 pass
             else:
                 self.fail(f"HttpRendezvous live exchange raised an unexpected exception: {e}")
@@ -105,18 +98,16 @@ class TestHttpRendezvousLive(unittest.TestCase):
         This test requires network access and depends on the broker's availability.
         It can be skipped by setting the environment variable SKIP_LIVE_TESTS=1.
         """
+        # No manual skip check needed here if decorator is active
         self._run_async(self._test_live_exchange_async())
 
 
 if __name__ == "__main__":
-    if SKIP_LIVE_TESTS:
+    if SKIP_LIVE_TESTS: # Check module-level variable for direct run message
         print("Skipping live integration tests (SKIP_LIVE_TESTS=1).")
     else:
         print(f"Running live integration tests against: {DEFAULT_BROKER_URL}")
         print(f"Using impersonation profile: {DEFAULT_IMPERSONATE_PROFILE}")
         print("Ensure you have network connectivity.")
-
-    # Configure logging for direct script run if needed
-    # logging.getLogger('client_py').setLevel(logging.DEBUG) # Example
 
     unittest.main()
