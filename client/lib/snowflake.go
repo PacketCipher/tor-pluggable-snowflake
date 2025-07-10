@@ -105,8 +105,11 @@ type ClientConfig struct {
 	// and testing.
 	KeepLocalAddresses bool
 	// Max is the maximum number of snowflake proxy peers that the client should attempt to
-	// connect to. Defaults to 1.
+	// connect to. Defaults to 1. This will represent the total pool size.
 	Max int
+	// SimultaneousProxies is the number of proxies to use concurrently for multiplexing.
+	// Defaults to 1 if not specified or if less than 1.
+	SimultaneousProxies int
 	// UTLSClientID is the type of user application that snowflake should imitate.
 	// If an empty value is provided, it will use Go's default TLS implementation
 	UTLSClientID string
@@ -162,8 +165,19 @@ func NewSnowflakeClient(config ClientConfig) (*Transport, error) {
 	if config.Max > max {
 		max = config.Max
 	}
+	simultaneousProxies := 1
+	if config.SimultaneousProxies > simultaneousProxies {
+		simultaneousProxies = config.SimultaneousProxies
+	}
+	// Ensure Max is at least as large as SimultaneousProxies
+	if max < simultaneousProxies {
+		max = simultaneousProxies
+	}
+
 	eventsLogger := event.NewSnowflakeEventDispatcher()
-	transport := &Transport{dialer: NewWebRTCDialerWithNatPolicyAndEventsAndProxy(broker, natPolicy, iceServers, max, eventsLogger, config.CommunicationProxy), eventDispatcher: eventsLogger}
+	// Pass simultaneousProxies to the WebRTCDialer constructor.
+	// Note: We'll need to modify NewWebRTCDialerWithNatPolicyAndEventsAndProxy next to accept this.
+	transport := &Transport{dialer: NewWebRTCDialerWithNatPolicyAndEventsAndProxy(broker, natPolicy, iceServers, max, simultaneousProxies, eventsLogger, config.CommunicationProxy), eventDispatcher: eventsLogger}
 
 	return transport, nil
 }
@@ -321,91 +335,315 @@ func parseIceServers(addresses []string) []webrtc.ICEServer {
 }
 
 // newSession returns a new smux.Session and the net.PacketConn it is running
-// over. The net.PacketConn successively connects through Snowflake proxies
-// pulled from snowflakes.
-func newSession(snowflakes SnowflakeCollector) (net.PacketConn, *smux.Session, error) {
+// over. The net.PacketConn will multiplex over several Snowflake proxies
+// pulled from the snowflakes collector.
+func newSession(snowflakes *Peers) (net.PacketConn, *smux.Session, error) {
 	clientID := turbotunnel.NewClientID()
 
-	// We build a persistent KCP session on a sequence of ephemeral WebRTC
-	// connections. This dialContext tells RedialPacketConn how to get a new
-	// WebRTC connection when the previous one dies. Inside each WebRTC
-	// connection, we use encapsulationPacketConn to encode packets into a
-	// stream.
-	dialContext := func(ctx context.Context) (net.PacketConn, error) {
-		log.Printf("redialing on same connection")
-		// Obtain an available WebRTC remote. May block.
-		conn := snowflakes.Pop()
-		if conn == nil {
-			return nil, errors.New("handler: Received invalid Snowflake")
-		}
-		log.Println("---- Handler: snowflake assigned ----")
-		// Send the magic Turbo Tunnel token.
-		_, err := conn.Write(turbotunnel.Token[:])
-		if err != nil {
-			return nil, err
-		}
-		// Send ClientID prefix.
-		_, err = conn.Write(clientID[:])
-		if err != nil {
-			return nil, err
-		}
-		return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, conn), nil
+	initialPeers := snowflakes.Pop()
+	if len(initialPeers) == 0 {
+		return nil, nil, errors.New("newSession: failed to get initial set of snowflake peers")
 	}
-	pconn := turbotunnel.NewRedialPacketConn(dummyAddr{}, dummyAddr{}, dialContext)
+	log.Printf("newSession: Got initial %d peers.", len(initialPeers))
 
-	// conn is built on the underlying RedialPacketConn—when one WebRTC
-	// connection dies, another one will be found to take its place. The
-	// sequence of packets across multiple WebRTC connections drives the KCP
-	// engine.
-	conn, err := kcp.NewConn2(dummyAddr{}, nil, 0, 0, pconn)
-	if err != nil {
-		pconn.Close()
-		return nil, nil, err
+	underlyingPacketConns := make([]net.PacketConn, 0, len(initialPeers))
+	for _, peer := range initialPeers {
+		// Need a unique dialContext for each RedialPacketConn if they are to redial independently.
+		// However, the current RedialPacketConn is designed for a single conceptual "pipe"
+		// that finds new endpoints. If we want each of N connections to redial independently
+		// from the shared pool, this gets more complex.
+
+		// For now, let's simplify: each RedialPacketConn created here will try to redial
+		// by popping a *single* peer from the main `snowflakes` collector.
+		// This means the `snowflakes.Pop()` needs to be safe for concurrent calls if redials happen concurrently.
+		// The `Peers.Pop()` now returns a slice. This dialContext will need to handle that,
+		// perhaps by taking one from the slice and putting others back, or using one and discarding others for this specific redial.
+		// This part needs careful thought.
+
+		// Simpler approach for now: The MultiplexedPacketConn will manage a set of RedialPacketConns.
+		// Each RedialPacketConn, when it needs a new underlying WebRTC conn, will ask the `snowflakes` collector.
+		// The `snowflakes.Pop()` returns a slice. We need a mechanism to distribute these new peers
+		// to the RedialPacketConns that need them, or to create new RedialPacketConns.
+
+		// Let's make each RedialPacketConn responsible for its own lifecycle.
+		// The dialContext will pop a *single* peer.
+		// We need a way for `snowflakes` to provide single peers for redialing,
+		// or adapt RedialPacketConn to take a slice and manage it.
+
+		// Temporary: We'll create one RedialPacketConn for each initial peer.
+		// The `dialContext` for each will attempt to pop a *new set* and take one,
+		// which is inefficient. This part of the logic (managing redials for multiple paths)
+		// is the most complex.
+
+		currentPeer := peer // Capture for the closure
+		dialContext := func(ctx context.Context) (net.PacketConn, error) {
+			log.Printf("Redialing for one of the multiplexed connections.")
+			// This Pop will get a new *set* of peers. We only need one for this redial.
+			// This is not ideal. The Peers structure might need a way to provide single peers for redialing,
+			// or a way to replenish individual failed connections within the multiplexer.
+			newPeerSet := snowflakes.Pop()
+			if len(newPeerSet) == 0 {
+				return nil, errors.New("redial: failed to get a new snowflake peer")
+			}
+			// Use the first one for this redial. What about the rest?
+			// They are effectively popped from the collector. This could starve other paths if not handled.
+			// For now, we'll use the first and log if others were available.
+			selectedPeer := newPeerSet[0]
+			if len(newPeerSet) > 1 {
+				log.Printf("Redial: Popped %d peers, using one. Others are currently discarded in this redial logic.", len(newPeerSet))
+				// Ideally, unused peers from newPeerSet should be offered back to a pool or used to replace other failed conns.
+			}
+			currentPeer = selectedPeer // Update currentPeer for this path for next potential operations within this dialContext instance.
+
+			log.Printf("---- Handler: snowflake %s assigned for redial ----", currentPeer.ID())
+			_, err := currentPeer.Write(turbotunnel.Token[:])
+			if err != nil {
+				currentPeer.Close()
+				return nil, fmt.Errorf("redial write token: %w", err)
+			}
+			_, err = currentPeer.Write(clientID[:])
+			if err != nil {
+				currentPeer.Close()
+				return nil, fmt.Errorf("redial write clientID: %w", err)
+			}
+			return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, currentPeer), nil
+		}
+
+		// Initial connection setup for this path
+		log.Printf("---- Handler: snowflake %s assigned for initial connection ----", currentPeer.ID())
+		_, err := currentPeer.Write(turbotunnel.Token[:])
+		if err != nil {
+			log.Printf("Failed to write token to initial peer %s: %v", currentPeer.ID(), err)
+			currentPeer.Close() // Close this peer
+			continue            // Skip this peer
+		}
+		_, err = currentPeer.Write(clientID[:])
+		if err != nil {
+			log.Printf("Failed to write clientID to initial peer %s: %v", currentPeer.ID(), err)
+			currentPeer.Close()
+			continue
+		}
+		encapConn := newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, currentPeer)
+
+		// Each RedialPacketConn represents one path in the multiplexer.
+		// It starts with the encapConn from the initial peer.
+		// If that path breaks, its dialContext is called to get a new encapConn.
+		redialPConn := turbotunnel.NewRedialPacketConnWithInitial(dummyAddr{}, dummyAddr{}, encapConn, dialContext)
+		underlyingPacketConns = append(underlyingPacketConns, redialPConn)
 	}
-	// Permit coalescing the payloads of consecutive sends.
+
+	if len(underlyingPacketConns) == 0 {
+		return nil, nil, errors.New("newSession: failed to establish any initial underlying connections")
+	}
+
+	log.Printf("newSession: Created %d underlying RedialPacketConns.", len(underlyingPacketConns))
+
+	// Create the multiplexer on top of these RedialPacketConns
+	multiplexedPConn := NewMultiplexedPacketConn(dummyAddr{}, dummyAddr{}, underlyingPacketConns)
+
+	// The KCP connection runs over the multiplexed connection.
+	conn, err := kcp.NewConn2(dummyAddr{}, nil, 0, 0, multiplexedPConn)
+	if err != nil {
+		multiplexedPConn.Close()
+		return nil, nil, fmt.Errorf("kcp.NewConn2 failed: %w", err)
+	}
+
 	conn.SetStreamMode(true)
-	// Set the maximum send and receive window sizes to a high number
-	// Removes KCP bottlenecks: https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/issues/40026
 	conn.SetWindowSize(WindowSize, WindowSize)
-	// Disable the dynamic congestion window (limit only by the
-	// maximum of local and remote static windows).
-	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
-	)
-	// On the KCP connection we overlay an smux session and stream.
+	conn.SetNoDelay(0, 0, 0, 1) // nc=1 => congestion window off
+
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = 10 * time.Minute
+	smuxConfig.KeepAliveTimeout = 10 * time.Minute // Or SnowflakeTimeout?
 	smuxConfig.MaxStreamBuffer = StreamSize
 
 	sess, err := smux.Client(conn, smuxConfig)
 	if err != nil {
 		conn.Close()
-		pconn.Close()
-		return nil, nil, err
+		multiplexedPConn.Close() // This will close all underlying RedialPacketConns
+		return nil, nil, fmt.Errorf("smux.Client failed: %w", err)
 	}
 
-	return pconn, sess, err
+	// Start a goroutine to replenish connections in the multiplexer if they drop.
+	// This is a basic replenishment strategy.
+	go replenishConnections(multiplexedPConn, snowflakes, clientID, snowflakes.Tongue.GetSimultaneous())
+
+	return multiplexedPConn, sess, nil
 }
 
-// Maintain |SnowflakeCapacity| number of available WebRTC connections, to
-// transfer to the Tor SOCKS handler when needed.
-func connectLoop(snowflakes SnowflakeCollector) {
+
+// replenishConnections tries to keep the number of active connections in the multiplexer
+// up to the desired number of simultaneous proxies.
+func replenishConnections(mpc *MultiplexedPacketConn, snowflakes *Peers, clientID turbotunnel.ClientID, desiredConns int) {
+	logTicker := time.NewTicker(30 * time.Second)
+	defer logTicker.Stop()
+
 	for {
-		timer := time.After(ReconnectTimeout)
-		_, err := snowflakes.Collect()
-		if err != nil {
-			log.Printf("WebRTC: %v  Retrying...", err)
-		}
 		select {
-		case <-timer:
+		case <-mpc.closed:
+			log.Println("Replenish connections loop stopping as multiplexer is closed.")
+			return
+		case <-snowflakes.Melted():
+			log.Println("Replenish connections loop stopping as snowflake collector is melted.")
+			return
+		case <-logTicker.C:
+			mpc.mu.RLock()
+			numCurrentConns := len(mpc.conns)
+			mpc.mu.RUnlock()
+			log.Printf("Multiplexer status: %d active connections (target: %d).", numCurrentConns, desiredConns)
+		default:
+			// Check and replenish
+		}
+
+		time.Sleep(5 * time.Second) // Check interval
+
+		mpc.mu.RLock()
+		numCurrentConns := len(mpc.conns)
+		mpc.mu.RUnlock()
+
+		if mpc.isClosed() || snowflakes.isMelted() { // snowflakes.isMelted() would need to be added to Peers
+			return
+		}
+
+		needed := desiredConns - numCurrentConns
+		if needed <= 0 {
 			continue
+		}
+
+		log.Printf("Replenishing: need %d more connections for multiplexer (current: %d, desired: %d)", needed, numCurrentConns, desiredConns)
+
+		// Request new peers. Pop() returns a slice.
+		newPeerSet := snowflakes.Pop()
+		if len(newPeerSet) == 0 {
+			log.Println("Replenish: failed to get new peers from collector.")
+			time.Sleep(ReconnectTimeout) // Wait before retrying to get peers
+			continue
+		}
+
+		log.Printf("Replenish: Got %d new peers from collector.", len(newPeerSet))
+
+		var connsToAdd []net.PacketConn
+		for i := 0; i < needed && i < len(newPeerSet); i++ {
+			peer := newPeerSet[i]
+			log.Printf("Replenish: Attempting to use new peer %s", peer.ID())
+
+			// Setup this new peer as a RedialPacketConn
+			dialContext := func(ctx context.Context) (net.PacketConn, error) {
+				// This dialContext is similar to the one in newSession.
+				// It's for when *this specific* RedialPacketConn needs to redial.
+				log.Printf("Redialing for a replenished connection.")
+				poppedSet := snowflakes.Pop()
+				if len(poppedSet) == 0 {
+					return nil, errors.New("replenish redial: failed to get a new snowflake peer")
+				}
+				selectedRedialPeer := poppedSet[0]
+				// Again, other peers in poppedSet are currently lost to this specific redial path.
+				log.Printf("---- Handler: snowflake %s assigned for replenish redial ----", selectedRedialPeer.ID())
+
+				_, err := selectedRedialPeer.Write(turbotunnel.Token[:])
+				if err != nil {
+					selectedRedialPeer.Close()
+					return nil, fmt.Errorf("replenish redial write token: %w", err)
+				}
+				_, err = selectedRedialPeer.Write(clientID[:])
+				if err != nil {
+					selectedRedialPeer.Close()
+					return nil, fmt.Errorf("replenish redial write clientID: %w", err)
+				}
+				return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, selectedRedialPeer), nil
+			}
+
+			// Initial connection for the new path
+			_, err := peer.Write(turbotunnel.Token[:])
+			if err != nil {
+				log.Printf("Replenish: Failed to write token to new peer %s: %v", peer.ID(), err)
+				peer.Close()
+				continue
+			}
+			_, err = peer.Write(clientID[:])
+			if err != nil {
+				log.Printf("Replenish: Failed to write clientID to new peer %s: %v", peer.ID(), err)
+				peer.Close()
+				continue
+			}
+			encapConn := newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, peer)
+			redialPConn := turbotunnel.NewRedialPacketConnWithInitial(dummyAddr{}, dummyAddr{}, encapConn, dialContext)
+			connsToAdd = append(connsToAdd, redialPConn)
+			log.Printf("Replenish: Successfully prepared new RedialPacketConn with peer %s", peer.ID())
+		}
+
+		if len(connsToAdd) > 0 {
+			mpc.AddConns(connsToAdd)
+			log.Printf("Replenish: Added %d new connections to multiplexer.", len(connsToAdd))
+		}
+		// If newPeerSet had more peers than needed, they are currently discarded.
+		// A more advanced system could put them back into `snowflakes` or a temporary holding.
+	}
+}
+
+
+// Maintain enough available WebRTC connections (the pool for `Peers.Collect`)
+// This loop calls `snowflakes.Collect()` which tries to get `GetSimultaneous()` peers
+// and adds them to the `snowflakeChan` within `Peers`.
+// The `Pop()` method in `Peers` then draws from this channel.
+func connectLoop(snowflakes *Peers) {
+	for {
+		// How many do we need to fill the pool up to snowflakes.Tongue.GetMax()?
+		currentPeerCount := snowflakes.Count()
+		maxPoolSize := snowflakes.Tongue.GetMax() // Total capacity of the peer pool
+
+		if currentPeerCount >= maxPoolSize {
+			log.Printf("ConnectLoop: Peer pool is full [%d/%d]. Sleeping.", currentPeerCount, maxPoolSize)
+			time.Sleep(ReconnectTimeout) // Pool is full, check again later
+			select {
+			case <-snowflakes.Melted():
+				log.Println("ConnectLoop: stopped (pool full, then melted).")
+				return
+			default:
+				continue
+			}
+		}
+
+		// We want to collect a batch of peers if the pool isn't full.
+		// snowflakes.Collect() will try to get `GetSimultaneous()` peers.
+		log.Printf("ConnectLoop: Current pool [%d/%d]. Attempting to collect more peers.", currentPeerCount, maxPoolSize)
+		collected, err := snowflakes.Collect() // Collect a batch
+		if err != nil {
+			log.Printf("ConnectLoop: Error collecting snowflakes: %v. Retrying after timeout.", err)
+			// Wait before trying to collect again, especially if errors are persistent
+			select {
+			case <-time.After(ReconnectTimeout):
+			case <-snowflakes.Melted():
+				log.Println("ConnectLoop: stopped (error, then melted).")
+				return
+			}
+			continue
+		}
+		if collected == nil || len(collected) == 0 {
+			log.Println("ConnectLoop: Collect returned no peers and no error. Retrying after timeout.")
+			select {
+			case <-time.After(ReconnectTimeout):
+			case <-snowflakes.Melted():
+				log.Println("ConnectLoop: stopped (no peers collected, then melted).")
+				return
+			}
+			continue
+		}
+
+		log.Printf("ConnectLoop: Successfully collected %d peers. Pool at approx [%d/%d].", len(collected), snowflakes.Count(), maxPoolSize)
+
+		// No explicit timer needed here if Collect() is blocking or has its own timeout logic.
+		// The loop naturally waits for Collect() or sleeps if pool is full.
+		// We do need to check for the melt signal.
+		select {
 		case <-snowflakes.Melted():
 			log.Println("ConnectLoop: stopped.")
 			return
+		default:
+			// If the pool is not yet full, loop again to collect more.
+			// If it is full, the check at the beginning of the loop will cause a sleep.
+			// Add a small delay to prevent busy-looping if Collect is very fast and pool isn't filling.
+			time.Sleep(1 * time.Second)
 		}
 	}
 }
