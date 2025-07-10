@@ -173,13 +173,16 @@ func main() {
 	logToStateDir := flag.Bool("log-to-state-dir", false, "resolve the log file relative to tor's pt state dir")
 	keepLocalAddresses := flag.Bool("keep-local-addresses", false, "keep local LAN address ICE candidates.\nThis is usually pointless because Snowflake proxies don't usually reside on the same local network as the client.")
 	unsafeLogging := flag.Bool("unsafe-logging", false, "keep IP addresses and other sensitive info in the logs")
-	max := flag.Int("max", DefaultSnowflakeCapacity,
-		"capacity for number of multiplexed WebRTC peers")
 	versionFlag := flag.Bool("version", false, "display version info to stderr and quit")
 
-	// Deprecated
-	oldLogToStateDir := flag.Bool("logToStateDir", false, "use -log-to-state-dir instead")
-	oldKeepLocalAddresses := flag.Bool("keepLocalAddresses", false, "use -keep-local-addresses instead")
+	// New flags for multiplexing
+	simultaneousProxies := flag.Int("simultaneous-proxies", 2, "Target number of Snowflake proxies to use concurrently.")
+	maxProxies := flag.Int("max-proxies", 4, "Total capacity of the Snowflake proxy pool (must be >= simultaneous-proxies).")
+
+	// Deprecated flags
+	oldLogToStateDir := flag.Bool("logToStateDir", false, "DEPRECATED: use -log-to-state-dir instead")
+	oldKeepLocalAddresses := flag.Bool("keepLocalAddresses", false, "DEPRECATED: use -keep-local-addresses instead")
+	deprecatedMax := flag.Int("max", DefaultSnowflakeCapacity, "DEPRECATED: use -max-proxies. Original meaning: capacity for number of WebRTC peers.")
 
 	flag.Parse()
 
@@ -219,7 +222,44 @@ func main() {
 		log.SetOutput(&safelog.LogScrubber{Output: logOutput})
 	}
 
-	log.Printf("snowflake-client %s\n", version.GetVersion())
+	log.Printf("---- Starting snowflake-client %s ----", version.GetVersion())
+	log.Printf("CLI Config: -log=\"%s\", -unsafe-logging=%t, -keep-local-addresses=%t", *logFilename, *unsafeLogging, *keepLocalAddresses || *oldKeepLocalAddresses)
+	log.Printf("CLI Multiplexing Config: -simultaneous-proxies=%d, -max-proxies=%d (deprecated -max=%d)", *simultaneousProxies, *maxProxies, *deprecatedMax)
+
+	// Determine effective max value, giving precedence to the new flag if it was explicitly set.
+	// A flag is considered "explicitly set" if its value is different from its default.
+	// This requires knowing the default value of maxProxies (4) and deprecatedMax (DefaultSnowflakeCapacity = 1).
+	effectiveMax := *maxProxies
+	// Check if -max-proxies was left at its default value
+	isMaxProxiesDefault := (*maxProxies == 4) // Assuming default of -max-proxies is 4
+
+	if isMaxProxiesDefault && (*deprecatedMax != DefaultSnowflakeCapacity) {
+		// If -max-proxies is default AND -max (deprecated) was set to non-default, use deprecatedMax.
+		log.Printf("Using deprecated -max value (%d) for pool capacity as -max-proxies was not explicitly set.", *deprecatedMax)
+		effectiveMax = *deprecatedMax
+	} else if !isMaxProxiesDefault {
+		// If -max-proxies was explicitly set, it takes precedence.
+		log.Printf("Using -max-proxies value (%d) for pool capacity.", *maxProxies)
+		// effectiveMax is already *maxProxies
+	} else {
+		// Both are default, effectiveMax is default of maxProxies.
+		log.Printf("Using default -max-proxies value (%d) for pool capacity.", *maxProxies)
+	}
+
+	// Validate and adjust proxy counts
+	effectiveSimultaneous := *simultaneousProxies
+	if effectiveSimultaneous <= 0 {
+		log.Printf("Warning: simultaneous-proxies was %d, adjusting to 1.", effectiveSimultaneous)
+		effectiveSimultaneous = 1
+	}
+	if effectiveMax < effectiveSimultaneous {
+		log.Printf("Warning: effective max pool size (%d) is less than simultaneous-proxies (%d). Adjusting max pool size to %d.",
+			effectiveMax, effectiveSimultaneous, effectiveSimultaneous)
+		effectiveMax = effectiveSimultaneous
+	}
+
+	log.Printf("Effective Multiplexing Config: SimultaneousProxies=%d, MaxPoolSize=%d", effectiveSimultaneous, effectiveMax)
+
 
 	iceAddresses := strings.Split(strings.TrimSpace(*iceServersCommas), ",")
 
@@ -241,7 +281,9 @@ func main() {
 		FrontDomains:       frontDomains,
 		ICEAddresses:       iceAddresses,
 		KeepLocalAddresses: *keepLocalAddresses || *oldKeepLocalAddresses,
-		Max:                *max,
+		// Use the effective values determined above
+		SimultaneousProxies: effectiveSimultaneous,
+		Max:                 effectiveMax,
 	}
 
 	// Begin goptlib client process.
