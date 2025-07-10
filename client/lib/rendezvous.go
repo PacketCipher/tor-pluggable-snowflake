@@ -250,7 +250,8 @@ type WebRTCDialer struct {
 	// and simply always send the current NAT type instead.
 	natPolicy    *NATPolicy
 	webrtcConfig *webrtc.Configuration
-	max          int
+	max          int // Total pool size
+	simultaneous int // Number of proxies to use concurrently
 
 	eventLogger event.SnowflakeEventReceiver
 	proxy       *url.URL
@@ -259,14 +260,14 @@ type WebRTCDialer struct {
 // Deprecated: Use NewWebRTCDialerWithNatPolicyAndEventsAndProxy instead
 func NewWebRTCDialer(broker *BrokerChannel, iceServers []webrtc.ICEServer, max int) *WebRTCDialer {
 	return NewWebRTCDialerWithNatPolicyAndEventsAndProxy(
-		broker, nil, iceServers, max, nil, nil,
+		broker, nil, iceServers, max, 1, nil, nil,
 	)
 }
 
 // Deprecated: Use NewWebRTCDialerWithNatPolicyAndEventsAndProxy instead
 func NewWebRTCDialerWithEvents(broker *BrokerChannel, iceServers []webrtc.ICEServer, max int, eventLogger event.SnowflakeEventReceiver) *WebRTCDialer {
 	return NewWebRTCDialerWithNatPolicyAndEventsAndProxy(
-		broker, nil, iceServers, max, eventLogger, nil,
+		broker, nil, iceServers, max, 1, eventLogger, nil,
 	)
 }
 
@@ -279,6 +280,7 @@ func NewWebRTCDialerWithEventsAndProxy(broker *BrokerChannel, iceServers []webrt
 		nil,
 		iceServers,
 		max,
+		1, // Default to 1 simultaneous proxy for old constructors
 		eventLogger,
 		proxy,
 	)
@@ -290,11 +292,18 @@ func NewWebRTCDialerWithNatPolicyAndEventsAndProxy(
 	natPolicy *NATPolicy,
 	iceServers []webrtc.ICEServer,
 	max int,
+	simultaneous int,
 	eventLogger event.SnowflakeEventReceiver,
 	proxy *url.URL,
 ) *WebRTCDialer {
 	config := webrtc.Configuration{
 		ICEServers: iceServers,
+	}
+	if simultaneous < 1 {
+		simultaneous = 1
+	}
+	if max < simultaneous {
+		max = simultaneous // Ensure pool size is at least number of simultaneous connections
 	}
 
 	return &WebRTCDialer{
@@ -302,6 +311,7 @@ func NewWebRTCDialerWithNatPolicyAndEventsAndProxy(
 		natPolicy:     natPolicy,
 		webrtcConfig:  &config,
 		max:           max,
+		simultaneous:  simultaneous,
 
 		eventLogger: eventLogger,
 		proxy:       proxy,
@@ -317,7 +327,12 @@ func (w WebRTCDialer) Catch() (*WebRTCPeer, error) {
 	)
 }
 
-// GetMax returns the maximum number of snowflakes to collect.
+// GetMax returns the maximum pool size of snowflakes to maintain.
 func (w WebRTCDialer) GetMax() int {
 	return w.max
+}
+
+// GetSimultaneous returns the number of proxies to use concurrently.
+func (w WebRTCDialer) GetSimultaneous() int {
+	return w.simultaneous
 }

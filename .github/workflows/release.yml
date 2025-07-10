@@ -1,0 +1,71 @@
+# .github/workflows/release.yml
+
+name: Build and Release Snowflake Client
+
+on:
+  # This workflow runs when a new tag is pushed.
+  # We recommend using semantic versioning tags like v1.0.0.
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Sets the permissions for the GITHUB_TOKEN to allow creating a release.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-alpine:
+    # We clarify the job name to reflect the target OS.
+    name: Build and Release for Alpine (snowflake-client)
+    runs-on: ubuntu-latest # The host runner is still Ubuntu
+
+    # We use a container to create a true Alpine build environment.
+    # The official golang image with an Alpine variant is perfect for this.
+    container:
+      image: golang:1.22-alpine
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Note: We no longer need the `setup-go` action because the
+      # `golang:1.22-alpine` container already has the correct Go version.
+
+      - name: Install Alpine dependencies
+        run: |
+          # Use Alpine's package manager `apk` instead of `apt-get`.
+          # build-base includes gcc and other tools needed for CGo (if any part of snowflake or its deps use it).
+          # czmq-dev was in your example; snowflake-client itself doesn't directly use czmq,
+          # but if other build targets in your repo might, it's harmless here.
+          # For a pure Go build like snowflake-client, only basic tools might be needed.
+          # Let's keep build-base for now as it's good practice for Go projects that might encounter CGo.
+          apk update
+          apk add build-base # czmq-dev might not be needed for snowflake-client
+
+      - name: Build Snowflake client for Alpine
+        run: |
+          # The binary name is updated to indicate it's a musl build for Alpine.
+          ARTIFACT_NAME="snowflake-client-linux-amd64-musl"
+
+          # Navigate to the client source directory which contains its main.go
+          # Based on our previous work, this is client/snowflake.go
+          cd client
+
+          # Build the Go binary. This will now be linked against musl libc.
+          # -ldflags strips debug symbols to reduce size.
+          # The output binary will be named $ARTIFACT_NAME and placed in the current directory (client/)
+          go build -v -ldflags="-s -w" -o $ARTIFACT_NAME snowflake.go
+
+          # Move the compiled binary to the root directory for easy upload
+          mv $ARTIFACT_NAME ../
+
+          # Set the asset path as an environment variable for the next step
+          echo "ASSET_PATH=./${ARTIFACT_NAME}" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        # This action creates a release and uploads assets.
+        # It automatically uses the tag name for the release title.
+        uses: softprops/action-gh-release@v2
+        with:
+          # The `files` input supports glob patterns. We upload the binary we built.
+          files: ${{ env.ASSET_PATH }}
