@@ -5,8 +5,10 @@ type Tongue interface {
 	// Catch makes a connection to a new snowflake.
 	Catch() (*WebRTCPeer, error)
 
-	// GetMax returns the maximum number of snowflakes a client can have.
+	// GetMax returns the maximum number of snowflakes a client can have (pool size).
 	GetMax() int
+	// GetSimultaneous returns the number of snowflakes to use concurrently.
+	GetSimultaneous() int
 }
 
 // SnowflakeCollector is an interface for managing a client's collection of snowflakes.

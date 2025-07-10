@@ -224,8 +224,9 @@ func (mpc *MultiplexedPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err e
 		// The remote address for WriteTo on a PacketConn is often ignored if the PacketConn
 		// was created by Dialing a specific remote. Here, we assume the underlying
 		// PacketConns (like RedialPacketConn) handle their own remote addressing.
-		// So, the `addr` parameter might be redundant or could be used for validation if needed.
-		n, err = connWrapper.pconn.WriteTo(p, connWrapper.pconn.RemoteAddr())
+		// We pass mpc.remoteAddr, which is the logical remote for the multiplexer.
+		// RedialPacketConn itself should use its configured remote.
+		n, err = connWrapper.pconn.WriteTo(p, mpc.remoteAddr)
 		mpc.mu.RLock() // Re-lock
 
 		if err != nil {

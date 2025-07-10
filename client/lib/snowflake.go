@@ -28,6 +28,7 @@ package snowflake_client
 import (
 	"context"
 	"errors"
+	"fmt" // Added fmt import
 	"log"
 	"math/rand"
 	"net"
@@ -375,60 +376,58 @@ func newSession(snowflakes *Peers) (net.PacketConn, *smux.Session, error) {
 		// which is inefficient. This part of the logic (managing redials for multiple paths)
 		// is the most complex.
 
-		currentPeer := peer // Capture for the closure
+		initialPathPeer := peer // Capture the specific peer for this path's first connection.
+		isFirstCallForPath := true // Flag to manage the first call to dialContext by NewRedialPacketConn.
+
+		// dialContext is called by NewRedialPacketConn for the initial connection,
+		// and then again if that connection fails and a redial is needed.
 		dialContext := func(ctx context.Context) (net.PacketConn, error) {
-			log.Printf("Redialing for one of the multiplexed connections.")
-			// This Pop will get a new *set* of peers. We only need one for this redial.
-			// This is not ideal. The Peers structure might need a way to provide single peers for redialing,
-			// or a way to replenish individual failed connections within the multiplexer.
-			newPeerSet := snowflakes.Pop()
-			if len(newPeerSet) == 0 {
-				return nil, errors.New("redial: failed to get a new snowflake peer")
-			}
-			// Use the first one for this redial. What about the rest?
-			// They are effectively popped from the collector. This could starve other paths if not handled.
-			// For now, we'll use the first and log if others were available.
-			selectedPeer := newPeerSet[0]
-			if len(newPeerSet) > 1 {
-				log.Printf("Redial: Popped %d peers, using one. Others are currently discarded in this redial logic.", len(newPeerSet))
-				// Ideally, unused peers from newPeerSet should be offered back to a pool or used to replace other failed conns.
-			}
-			currentPeer = selectedPeer // Update currentPeer for this path for next potential operations within this dialContext instance.
+			var selectedPeer *WebRTCPeer
+			var operationType string
 
-			log.Printf("---- Handler: snowflake %s assigned for redial ----", currentPeer.ID())
-			_, err := currentPeer.Write(turbotunnel.Token[:])
+			if isFirstCallForPath {
+				log.Println("DialContext: First call, using pre-assigned initial peer for a new path.")
+				selectedPeer = initialPathPeer
+				isFirstCallForPath = false // Subsequent calls to *this specific dialContext instance* will be redials.
+				operationType = "initial connection"
+			} else {
+				log.Println("DialContext: Redialing for an existing path.")
+				operationType = "redial"
+				newPeerSet := snowflakes.Pop() // Pop a new set of peers for redial
+				if len(newPeerSet) == 0 {
+					return nil, errors.New("dialContext redial: failed to get a new snowflake peer from pool")
+				}
+				selectedPeer = newPeerSet[0] // Use the first one for this redial.
+				if len(newPeerSet) > 1 {
+					log.Printf("DialContext redial: Popped %d peers, using one for this path. Others currently discarded.", len(newPeerSet))
+					// TODO: Consider how to handle/return unused peers from newPeerSet to the main pool or a temporary buffer.
+				}
+				log.Println("---- Handler: new snowflake peer assigned for redial ----")
+			}
+
+			// Common logic to prepare the selectedPeer
+			if selectedPeer == nil { // Should not happen if logic is correct
+				return nil, errors.New("dialContext: selectedPeer is nil, this should not happen")
+			}
+
+			_, err := selectedPeer.Write(turbotunnel.Token[:])
 			if err != nil {
-				currentPeer.Close()
-				return nil, fmt.Errorf("redial write token: %w", err)
+				log.Printf("DialContext: Failed to write token to peer for %s: %v", operationType, err)
+				selectedPeer.Close()
+				return nil, fmt.Errorf("dialContext write token for %s: %w", operationType, err)
 			}
-			_, err = currentPeer.Write(clientID[:])
+			_, err = selectedPeer.Write(clientID[:])
 			if err != nil {
-				currentPeer.Close()
-				return nil, fmt.Errorf("redial write clientID: %w", err)
+				log.Printf("DialContext: Failed to write clientID to peer for %s: %v", operationType, err)
+				selectedPeer.Close()
+				return nil, fmt.Errorf("dialContext write clientID for %s: %w", operationType, err)
 			}
-			return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, currentPeer), nil
+			log.Printf("---- Handler: snowflake peer successfully prepared for %s ----", operationType)
+			return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, selectedPeer), nil
 		}
 
-		// Initial connection setup for this path
-		log.Printf("---- Handler: snowflake %s assigned for initial connection ----", currentPeer.ID())
-		_, err := currentPeer.Write(turbotunnel.Token[:])
-		if err != nil {
-			log.Printf("Failed to write token to initial peer %s: %v", currentPeer.ID(), err)
-			currentPeer.Close() // Close this peer
-			continue            // Skip this peer
-		}
-		_, err = currentPeer.Write(clientID[:])
-		if err != nil {
-			log.Printf("Failed to write clientID to initial peer %s: %v", currentPeer.ID(), err)
-			currentPeer.Close()
-			continue
-		}
-		encapConn := newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, currentPeer)
-
-		// Each RedialPacketConn represents one path in the multiplexer.
-		// It starts with the encapConn from the initial peer.
-		// If that path breaks, its dialContext is called to get a new encapConn.
-		redialPConn := turbotunnel.NewRedialPacketConnWithInitial(dummyAddr{}, dummyAddr{}, encapConn, dialContext)
+		// NewRedialPacketConn will call dialContext immediately for the first connection.
+		redialPConn := turbotunnel.NewRedialPacketConn(dummyAddr{}, dummyAddr{}, dialContext)
 		underlyingPacketConns = append(underlyingPacketConns, redialPConn)
 	}
 
@@ -525,51 +524,60 @@ func replenishConnections(mpc *MultiplexedPacketConn, snowflakes *Peers, clientI
 		var connsToAdd []net.PacketConn
 		for i := 0; i < needed && i < len(newPeerSet); i++ {
 			peer := newPeerSet[i]
-			log.Printf("Replenish: Attempting to use new peer %s", peer.ID())
+			log.Println("Replenish: Attempting to use new peer for a new path.")
+
+			newPathPeer := peer // Capture the peer assigned for this new path.
+			isFirstCallForPath := true
 
 			// Setup this new peer as a RedialPacketConn
 			dialContext := func(ctx context.Context) (net.PacketConn, error) {
-				// This dialContext is similar to the one in newSession.
-				// It's for when *this specific* RedialPacketConn needs to redial.
-				log.Printf("Redialing for a replenished connection.")
-				poppedSet := snowflakes.Pop()
-				if len(poppedSet) == 0 {
-					return nil, errors.New("replenish redial: failed to get a new snowflake peer")
-				}
-				selectedRedialPeer := poppedSet[0]
-				// Again, other peers in poppedSet are currently lost to this specific redial path.
-				log.Printf("---- Handler: snowflake %s assigned for replenish redial ----", selectedRedialPeer.ID())
+				var selectedPeer *WebRTCPeer
+				var operationType string
 
-				_, err := selectedRedialPeer.Write(turbotunnel.Token[:])
-				if err != nil {
-					selectedRedialPeer.Close()
-					return nil, fmt.Errorf("replenish redial write token: %w", err)
+				if isFirstCallForPath {
+					log.Println("DialContext (Replenish): First call, using pre-assigned peer for new path.")
+					selectedPeer = newPathPeer
+					isFirstCallForPath = false
+					operationType = "initial connection for replenished path"
+				} else {
+					log.Println("DialContext (Replenish): Redialing for an existing replenished path.")
+					operationType = "redial for replenished path"
+					newPeerSet := snowflakes.Pop()
+					if len(newPeerSet) == 0 {
+						return nil, errors.New("dialContext replenish redial: failed to get new peer from pool")
+					}
+					selectedPeer = newPeerSet[0]
+					if len(newPeerSet) > 1 {
+						log.Printf("DialContext replenish redial: Popped %d peers, using one. Others discarded.", len(newPeerSet))
+						// TODO: Handle unused peers
+					}
+					log.Println("---- Handler: new snowflake peer assigned for replenish redial ----")
 				}
-				_, err = selectedRedialPeer.Write(clientID[:])
-				if err != nil {
-					selectedRedialPeer.Close()
-					return nil, fmt.Errorf("replenish redial write clientID: %w", err)
+
+				if selectedPeer == nil {
+					return nil, errors.New("dialContext (Replenish): selectedPeer is nil")
 				}
-				return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, selectedRedialPeer), nil
+
+				_, err := selectedPeer.Write(turbotunnel.Token[:])
+				if err != nil {
+					log.Printf("DialContext (Replenish): Failed to write token for %s: %v", operationType, err)
+					selectedPeer.Close()
+					return nil, fmt.Errorf("dialContext (Replenish) write token for %s: %w", operationType, err)
+				}
+				_, err = selectedPeer.Write(clientID[:])
+				if err != nil {
+					log.Printf("DialContext (Replenish): Failed to write clientID for %s: %v", operationType, err)
+					selectedPeer.Close()
+					return nil, fmt.Errorf("dialContext (Replenish) write clientID for %s: %w", operationType, err)
+				}
+				log.Printf("---- Handler: snowflake peer successfully prepared for %s ----", operationType)
+				return newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, selectedPeer), nil
 			}
 
-			// Initial connection for the new path
-			_, err := peer.Write(turbotunnel.Token[:])
-			if err != nil {
-				log.Printf("Replenish: Failed to write token to new peer %s: %v", peer.ID(), err)
-				peer.Close()
-				continue
-			}
-			_, err = peer.Write(clientID[:])
-			if err != nil {
-				log.Printf("Replenish: Failed to write clientID to new peer %s: %v", peer.ID(), err)
-				peer.Close()
-				continue
-			}
-			encapConn := newEncapsulationPacketConn(dummyAddr{}, dummyAddr{}, peer)
-			redialPConn := turbotunnel.NewRedialPacketConnWithInitial(dummyAddr{}, dummyAddr{}, encapConn, dialContext)
+			// NewRedialPacketConn will call dialContext immediately for the first connection.
+			redialPConn := turbotunnel.NewRedialPacketConn(dummyAddr{}, dummyAddr{}, dialContext)
 			connsToAdd = append(connsToAdd, redialPConn)
-			log.Printf("Replenish: Successfully prepared new RedialPacketConn with peer %s", peer.ID())
+			log.Println("Replenish: Successfully prepared new RedialPacketConn with a new peer for the multiplexer.")
 		}
 
 		if len(connsToAdd) > 0 {
